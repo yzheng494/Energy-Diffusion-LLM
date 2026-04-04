@@ -1,11 +1,16 @@
 # To enable preemption re-loading, set `hydra.run.dir` or 
 # `checkpointing.save_dir` explicitly.
 
-source activate edlm
-
 exp=arebm_owt_ckpt
 
-cd ${path}
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+repo_root="$(cd "${script_dir}/.." && pwd)"
+
+cd "${repo_root}"
+
+export CUDA_VISIBLE_DEVICES=1
+export WANDB_DISABLE_SERVICE=true
+export WANDB_MODE=offline
 
 python -u -m main \
     loader.batch_size=16 \

@@ -1077,7 +1077,8 @@ class EBM(Diffusion):
         config_arebm.model.causal = True
         config_arebm.backbone = 'ar'
       self.ebm = Diffusion.load_from_checkpoint(
-        '../checkpoints/ar.ckpt',
+        os.path.join(self.config.path, 'checkpoints/ar.ckpt'),
+        map_location='cpu',
         tokenizer=tokenizer,
         config=config_arebm).backbone
     else:

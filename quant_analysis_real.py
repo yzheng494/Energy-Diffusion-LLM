@@ -1,22 +1,45 @@
 """
-Quantization analysis for EBM inference.
+Quantization analysis for EBM inference — TRUE quantization edition.
 
-Runs 5 experiments:
-  1. Default (no quantization)
-  2. fp4  - bitsandbytes 4-bit FloatingPoint
-  3. fp8  - simulated FP8 weight-only (torch.float8_e4m3fn cast)
-  4. int8 - bitsandbytes 8-bit LLM.int8()
-  5. nf4  - bitsandbytes 4-bit NormalFloat
+Unlike quant_analysis.py (which simulates quantization by quantizing then
+immediately dequantizing weights back to float32), this script performs REAL
+quantization: nn.Linear modules inside model.ebm are replaced with lower-
+precision counterparts that store compressed weights and dequantize on-the-fly
+at each forward pass.  This gives genuine memory savings and realistic
+compute-time behaviour.
 
-All experiments start from the same x0. After the default trajectory is
-recorded, each quantized model runs from the same x0 with the same RNG
-seed so that stochasticity is controlled. At every denoising step we record:
+Supported quant_type values:
+  - 'nf4':  bitsandbytes Linear4bit (NormalFloat 4-bit)  — bnb.nn.Linear4bit
+  - 'fp4':  bitsandbytes Linear4bit (FloatingPoint 4-bit) — bnb.nn.Linear4bit
+  - 'int8': bitsandbytes Linear8bitLt (LLM.int8())        — bnb.nn.Linear8bitLt
+  - 'fp8':  custom FP8Linear (torch.float8_e4m3fn storage) — dequant at forward
+
+model.backbone (frozen HF diffusion model) is intentionally NOT quantized
+because it contains FlashAttention kernels that are sensitive to weight dtype.
+model.ebm uses the same FlashAttention kernels, but all bnb quantized modules
+produce bf16 outputs (matching the autocast context in AR.forward), so they
+remain compatible.
+
+Runs 5 experiments (default + 4 quantized), all starting from the same x0
+with the same RNG seed.  At every denoising step records:
   - Normalised L2 divergence  ||x_q - x_ref||_2 / ||x_ref||_2
   - Token-level accuracy  mean(x_q == x_ref)
-A two-panel figure is saved to outputs/quant_analysis/quant_comparison.png.
+Generative perplexity (GPT-2 large) of argmax(p_x0) is scored every 10 steps.
+A three-panel figure is saved to <hydra_run_dir>/quant_analysis_real/.
 """
 
 import os
+import sys
+from unittest.mock import MagicMock
+
+# causal_conv1d has an ABI mismatch with PyTorch 2.8; stub it out since
+# DiMamba is never used in this analysis (ebm_backbone=ar only).
+for _mod in (
+    "causal_conv1d", "causal_conv1d_cuda", "mamba_ssm",
+    "mamba_ssm.ops.selective_scan_interface",
+    "mamba_ssm.ops.triton.selective_state_update",
+):
+    sys.modules.setdefault(_mod, MagicMock())
 
 import hydra
 import lightning as L
@@ -30,21 +53,12 @@ import torch.nn.functional as F
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-# causal_conv1d has an ABI mismatch with PyTorch 2.8; stub it out since
-# DiMamba is never used in this analysis (ebm_backbone=ar only).
-import sys
-from unittest.mock import MagicMock
-for _mod in ("causal_conv1d", "causal_conv1d_cuda", "mamba_ssm",
-             "mamba_ssm.ops.selective_scan_interface",
-             "mamba_ssm.ops.triton.selective_state_update"):
-    sys.modules.setdefault(_mod, MagicMock())
-
 import dataloader
 import diffusion as diff_module
 from diffusion import EBM, _sample_categorical
 
 # ---------------------------------------------------------------------------
-# Hydra resolver registration (mirrors main.py)
+# Hydra resolver registration  (mirrors main.py)
 # ---------------------------------------------------------------------------
 for _name, _fn in [
     ("cwd", os.getcwd),
@@ -55,75 +69,221 @@ for _name, _fn in [
     try:
         omegaconf.OmegaConf.register_new_resolver(_name, _fn)
     except omegaconf.exceptions.OmegaConfException:
-        pass  # already registered
+        pass
 
 
 # ---------------------------------------------------------------------------
-# Quantisation helper
+# Custom FP8 linear module
 # ---------------------------------------------------------------------------
 
-def quantize_model(model: nn.Module, quant_type: str) -> nn.Module:
-    """Simulate weight-only quantization on all nn.Linear layers in-place.
+class FP8Linear(nn.Module):
+    """nn.Linear replacement that stores the weight tensor in float8_e4m3fn.
 
-    Instead of replacing modules (which disrupts dtype flow and breaks
-    FlashAttention), we quantize each weight to the target format and
-    immediately dequantize it back to its original dtype.  This correctly
-    captures precision loss from quantization while leaving the module
-    structure — and every intermediate tensor dtype — completely unchanged.
+    On each forward call the weight is dequantized to the input tensor's dtype
+    (or compute_dtype if provided) before the matrix multiply.  This gives
+    genuine fp8 weight compression with realistic per-step dequant overhead.
 
-    Supported quant_type values:
-      - 'nf4': bitsandbytes 4-bit NormalFloat  (quantize → dequantize)
-      - 'fp4': bitsandbytes 4-bit FloatingPoint (quantize → dequantize)
-      - 'int8': round weights to int8 range     (quantize → dequantize)
-      - 'fp8': cast weights through float8_e4m3fn (quantize → dequantize)
+    Bias (if present) is kept in float32 and cast at forward time.
     """
+
+    def __init__(
+        self,
+        weight_fp8: torch.Tensor,
+        bias: "nn.Parameter | None",
+        compute_dtype: torch.dtype = torch.bfloat16,
+    ):
+        super().__init__()
+        # Store compressed weight as a non-trainable buffer.
+        self.register_buffer("weight_fp8", weight_fp8)
+        self.compute_dtype = compute_dtype
+        if bias is not None:
+            self.bias = nn.Parameter(bias.data.clone())
+        else:
+            self.register_parameter("bias", None)
+
+    @property
+    def weight(self):
+        """Expose .weight for any code that inspects module.weight."""
+        return self.weight_fp8
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        dtype = self.compute_dtype if self.compute_dtype is not None else x.dtype
+        w = self.weight_fp8.to(dtype)
+        out = F.linear(x.to(dtype), w)
+        if self.bias is not None:
+            out = out + self.bias.to(dtype)
+        return out
+
+
+# ---------------------------------------------------------------------------
+# Module-replacement quantization
+# ---------------------------------------------------------------------------
+
+class _BF16Adapter(nn.Module):
+    """Forces the input into bfloat16 before the inner module.
+
+    bitsandbytes (Linear4bit / Linear8bitLt) bypasses PyTorch's torch.autocast
+    and outputs in whatever dtype the input tensor has.  The LayerNorm in the
+    AR model explicitly disables autocast and returns float32, so without this
+    adapter the qkv projection would produce float32 qkv tensors — which
+    FlashAttention rejects (it only accepts fp16 / bf16).
+
+    Wrapping every replaced bnb module with this adapter keeps the dtype flow
+    identical to the unquantized model (autocast bfloat16 throughout).
+    """
+
+    def __init__(self, inner: nn.Module, dtype: torch.dtype = torch.bfloat16):
+        super().__init__()
+        self.inner = inner
+        self.dtype = dtype
+
+    @property
+    def weight(self):
+        return self.inner.weight
+
+    @property
+    def bias(self):
+        return getattr(self.inner, "bias", None)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.inner(x.to(self.dtype))
+
+
+def _make_quantized_linear(
+    m: nn.Linear, quant_type: str
+) -> nn.Module:
+    """Return a quantized replacement for a single nn.Linear layer."""
+    import bitsandbytes as bnb
+
+    if quant_type in ("nf4", "fp4"):
+        # Linear4bit stores the weight as packed uint8 (two 4-bit values per byte)
+        # and dequantizes to compute_dtype on each forward call.
+        inner = bnb.nn.Linear4bit(
+            m.in_features,
+            m.out_features,
+            bias=m.bias is not None,
+            quant_type=quant_type,
+            compute_dtype=torch.bfloat16,
+        )
+        # Replace the weight with a Params4bit wrapping the original data.
+        inner.weight = bnb.nn.Params4bit(
+            data=m.weight.data.to(torch.float32),
+            requires_grad=False,
+            quant_type=quant_type,
+        )
+        if m.bias is not None:
+            inner.bias = nn.Parameter(m.bias.data.clone())
+
+    elif quant_type == "int8":
+        # Linear8bitLt uses LLM.int8() mixed-precision: outlier columns in fp16,
+        # remaining columns in int8.  has_fp16_weights=False triggers quantization.
+        inner = bnb.nn.Linear8bitLt(
+            m.in_features,
+            m.out_features,
+            bias=m.bias is not None,
+            has_fp16_weights=False,
+            threshold=6.0,  # LLM.int8 standard threshold for outlier detection
+        )
+        inner.weight = bnb.nn.Int8Params(
+            data=m.weight.data,
+            has_fp16_weights=False,
+            requires_grad=False,
+        )
+        if m.bias is not None:
+            inner.bias = nn.Parameter(m.bias.data.clone())
+
+    elif quant_type == "fp8":
+        # FP8Linear already casts input to bf16 in its forward — no adapter needed.
+        w_fp8 = m.weight.data.to(torch.float32).to(torch.float8_e4m3fn)
+        return FP8Linear(w_fp8, m.bias, compute_dtype=torch.bfloat16)
+
+    else:
+        raise ValueError(f"Unknown quant_type: {quant_type!r}")
+
+    # Wrap bnb modules so input is forced to bf16 before the bnb forward.
+    # bnb bypasses torch.autocast and returns in the input's dtype; without this
+    # the LayerNorm float32 output would propagate and break FlashAttention.
+    return _BF16Adapter(inner, dtype=torch.bfloat16)
+
+
+def _replace_linear_recursive(model: nn.Module, quant_type: str) -> None:
+    """Recursively walk model and replace every nn.Linear in-place."""
+    for name, child in list(model.named_children()):
+        if isinstance(child, nn.Linear):
+            new_child = _make_quantized_linear(child, quant_type)
+            setattr(model, name, new_child)
+        else:
+            _replace_linear_recursive(child, quant_type)
+
+
+def quantize_model_real(model: nn.Module, quant_type: str) -> nn.Module:
+    """Replace all nn.Linear modules with true quantized counterparts.
+
+    The module is modified in-place.  Returns the same model object for
+    convenience.  Prints a mean weight perturbation diagnostic (requires one
+    forward to actually quantize 4-bit/8-bit bnb layers; for those we compute
+    perturbation from the float32 reference weight before replacement).
+    """
+    total_err, total_numel = 0.0, 0
+
+    # Collect original weights BEFORE replacement so we can measure perturbation.
+    orig_weights: dict[str, torch.Tensor] = {}
+    for name, m in model.named_modules():
+        if isinstance(m, nn.Linear):
+            w = m.weight.data
+            if w.dtype in (torch.float16, torch.bfloat16, torch.float32):
+                orig_weights[name] = w.float().clone()
+
+    _replace_linear_recursive(model, quant_type)
+
+    # Measure perturbation: compare dequantized weight vs original.
+    # For bnb 4-bit/8-bit the weight is not yet quantized until the first
+    # forward pass, so we approximate by quantizing to float32 here.
     import bitsandbytes.functional as bnb_F
 
-    total_err, total_numel = 0.0, 0
-    for module in model.modules():
-        if not isinstance(module, nn.Linear):
-            continue
-        w = module.weight.data
-        if w.dtype not in (torch.float16, torch.bfloat16, torch.float32):
-            continue
+    # Unwrap _BF16Adapter to get the underlying bnb/FP8 module for inspection.
+    def _unwrap(m):
+        return m.inner if isinstance(m, _BF16Adapter) else m
 
-        orig_dtype = w.dtype
-        w_orig = w.clone()
+    import bitsandbytes as bnb
+    for name, m in model.named_modules():
+        if name not in orig_weights:
+            continue
+        w_orig = orig_weights[name]
+        core = _unwrap(m)
 
         if quant_type in ("nf4", "fp4"):
-            # Use float32 input (not float16) so the 4-bit quantization noise
-            # is not erased by a subsequent bfloat16 re-rounding.
-            # Keep result in float32 for the same reason — the autocast context
-            # will handle compute dtype during the forward pass.
-            w_f32 = w.to(torch.float32)
-            q_w, state = bnb_F.quantize_4bit(
-                w_f32, quant_type=quant_type, compress_statistics=False
-            )
-            w_dq = bnb_F.dequantize_4bit(q_w, state, quant_type=quant_type)
-            module.weight.data = w_dq.to(torch.float32)
+            if isinstance(core, bnb.nn.Linear4bit):
+                w_f32 = core.weight.data
+                if w_f32 is None or w_f32.dtype == torch.uint8:
+                    continue
+                q_w, state = bnb_F.quantize_4bit(
+                    w_f32.to(torch.float32), quant_type=quant_type,
+                    compress_statistics=False
+                )
+                w_dq = bnb_F.dequantize_4bit(q_w, state, quant_type=quant_type)
+                total_err += (w_dq.float() - w_orig).norm().item()
+                total_numel += w_orig.numel()
 
         elif quant_type == "int8":
-            w_f32 = w.to(torch.float32)
-            scale = w_f32.abs().max() / 127.0
-            w_int8 = (w_f32 / scale).round().clamp(-128, 127).to(torch.int8)
-            module.weight.data = (w_int8.to(torch.float32) * scale).to(torch.float32)
+            # Approximate: per-tensor int8 round-trip.
+            scale = w_orig.abs().max() / 127.0
+            w_int8 = (w_orig / scale).round().clamp(-128, 127).to(torch.int8)
+            w_dq = w_int8.float() * scale
+            total_err += (w_dq - w_orig).norm().item()
+            total_numel += w_orig.numel()
 
         elif quant_type == "fp8":
-            # Keep in float32 so the fp8 rounding pattern is preserved and not
-            # collapsed back into bfloat16's coarser grid.
-            w_f32 = w.to(torch.float32)
-            w_fp8 = w_f32.to(torch.float8_e4m3fn)
-            module.weight.data = w_fp8.to(torch.float32)
-
-        else:
-            raise ValueError(f"Unknown quant_type: {quant_type}")
-
-        total_err += (module.weight.data.float() - w_orig.float()).norm().item()
-        total_numel += w.numel()
+            if isinstance(core, FP8Linear):
+                w_dq = core.weight_fp8.float()
+                total_err += (w_dq - w_orig).norm().item()
+                total_numel += w_orig.numel()
 
     mean_err = total_err / max(total_numel, 1)
-    print(f"[quantize_model] {quant_type}: mean weight perturbation = {mean_err:.6e} "
-          f"over {total_numel} params")
+    print(
+        f"[quantize_model_real] {quant_type}: mean weight perturbation = "
+        f"{mean_err:.6e} over {total_numel} params"
+    )
     return model
 
 
@@ -135,8 +295,10 @@ def quantize_model(model: nn.Module, quant_type: str) -> nn.Module:
 def run_trajectory(model: EBM, x0: torch.Tensor, num_steps: int, eps: float = 1e-5):
     """Run the full EBM denoising trajectory starting from x0.
 
-    Returns a list of (batch, seq_len) LongTensors, one per step
-    (including the initial x0 and the final noise-removal step if enabled).
+    Returns:
+        trajectory:  list of (batch, seq_len) LongTensors, one per step.
+        x0_preds:    list of argmax(p_x0) per step; x0_preds[0] is None
+                     (step 0 has all-mask input, no clean prediction yet).
     """
     x = x0.clone().to(model.device)
     timesteps = torch.linspace(1, eps, num_steps + 1, device=model.device)
@@ -144,8 +306,6 @@ def run_trajectory(model: EBM, x0: torch.Tensor, num_steps: int, eps: float = 1e
     p_x0_cache = None
 
     trajectory = [x.clone().cpu()]
-    # best-guess clean sequences: argmax(p_x0) at each step, scored for ppl.
-    # Step 0 has no p_x0 yet (all masks), so we skip it (None placeholder).
     x0_preds = [None]
 
     for i in range(num_steps):
@@ -156,10 +316,8 @@ def run_trajectory(model: EBM, x0: torch.Tensor, num_steps: int, eps: float = 1e
         if p_x0_cache is None:
             if (t[0] > model.config.sampling.is_start
                     or t[0] < model.config.sampling.is_end):
-                # Outside importance-sampling window — cache p_x0 directly.
                 p_x0_cache = p_x0
             else:
-                # Energy-based importance sampling (mirrors EBM._sample).
                 k = model.config.sampling.is_size
                 x0_samples = _sample_categorical(p_x0, num_samples=k)
                 energy = model.ebm_forward(
@@ -182,8 +340,6 @@ def run_trajectory(model: EBM, x0: torch.Tensor, num_steps: int, eps: float = 1e
                 ).float()
                 _, x_next = model._ddpm_caching_update(x, t, dt, p_x0=p_x0_cache)
 
-        # Record the model's best guess of the clean sequence at this step.
-        # We clamp to vocab_size-1 to exclude the mask token index from argmax.
         current_p_x0 = p_x0_cache if p_x0_cache is not None else p_x0
         x0_pred = current_p_x0[..., :model.mask_index].argmax(dim=-1)
         x0_preds.append(x0_pred.clone().cpu())
@@ -198,9 +354,9 @@ def run_trajectory(model: EBM, x0: torch.Tensor, num_steps: int, eps: float = 1e
         unet_conditioning = model.noise(t)[0]
         x = model.forward(x, unet_conditioning).argmax(dim=-1)
         trajectory.append(x.clone().cpu())
-        x0_preds.append(x.clone().cpu())  # final = noise-removed sequence
+        x0_preds.append(x.clone().cpu())
 
-    return trajectory, x0_preds  # x0_preds[0] is None (step 0 has no prediction)
+    return trajectory, x0_preds
 
 
 @torch.no_grad()
@@ -210,19 +366,7 @@ def run_trajectory_cross_step(
     """Cross-step EBM denoising trajectory.
 
     Normal strategy uses g[t-1] (last IS result) for sample_update.
-    Cross-step uses g[t-2] (two steps earlier) instead:
-
-        for t in 0..1 (warm-up):          # initialise g_buf normally
-            x_next = sample_update(x, g[t-1])
-            p_x0   = fwd(x)
-            g[t]   = bwd(p_x0)            # IS
-        for t >= 2:
-            x_next = sample_update(x, g[t-2])
-            p_x0   = fwd(x)               # always fresh
-            g[t]   = bwd(p_x0)            # IS
-
-    Quantized models are supported transparently: model.ebm_forward runs on
-    whatever precision model.ebm was set to before calling this function.
+    Cross-step uses g[t-2] (two steps earlier) instead.
 
     Returns:
         trajectory: list of (batch, seq_len) LongTensors, one per step.
@@ -235,35 +379,25 @@ def run_trajectory_cross_step(
     trajectory = [x.clone().cpu()]
     x0_preds = [None]
 
-    # g_buf[0] = g[t-2], g_buf[1] = g[t-1]
     g_buf = [None, None]
 
     for i in range(num_steps):
         t = timesteps[i] * torch.ones(x.shape[0], 1, device=model.device)
-
-        # --- sample_update(x, g[t-2 or t-1]) ---
-        # Warm-up (i < 2): use g[t-1]; cross-step (i >= 2): use g[t-2].
         p_x0_for_update = g_buf[0] if i >= 2 else g_buf[1]
 
         if p_x0_for_update is None:
-            # First warm-up step: _ddpm_caching_update will run forward internally;
-            # reuse the returned p_x0 to avoid a redundant forward pass.
             p_x0_fresh, x_next = model._ddpm_caching_update(
                 x, t, dt, p_x0=None
             )
         else:
-            # Use the stored gradient for sample_update (skips internal forward).
             _, x_next = model._ddpm_caching_update(x, t, dt, p_x0=p_x0_for_update)
-            # fwd: always run a fresh forward on current x to compute g[t].
             sigma_t, _ = model.noise(t)
             p_x0_fresh = model.forward(x, sigma_t).exp()
 
-        # --- bwd: IS on p_x0_fresh → g[t] ---
         if (
             t[0] > model.config.sampling.is_start
             or t[0] < model.config.sampling.is_end
         ):
-            # Outside IS window — use raw diffusion p_x0 as gradient.
             g_t = p_x0_fresh
         else:
             k = model.config.sampling.is_size
@@ -285,7 +419,6 @@ def run_trajectory_cross_step(
             x0_selected = x0_samples[torch.arange(x.shape[0]), x0_index]
             g_t = F.one_hot(x0_selected, num_classes=model.vocab_size).float()
 
-        # Shift buffer: g_buf[0]=g[t-2] ← old g[t-1]; g_buf[1]=g[t-1] ← g[t]
         g_buf[0] = g_buf[1]
         g_buf[1] = g_t
 
@@ -324,14 +457,13 @@ def compute_metrics(traj_ref, traj_q):
 
 
 def compute_ppl_trajectory(model, x0_preds, tokenizer, log_every: int = 10):
-    """Score each step's best-guess clean sequence with the model's GPT-2 eval.
+    """Score each step's best-guess clean sequence with GPT-2 generative ppl.
 
     x0_preds: list returned by run_trajectory — x0_preds[0] is None (skipped).
-    log_every: only score every N steps to save time (GPT-2 forward is costly).
 
     Returns:
-        step_indices: list of step indices that were scored
-        ppls: corresponding generative perplexity values
+        step_indices: list of step indices that were scored.
+        ppls: corresponding generative perplexity values.
     """
     step_indices, ppls = [], []
     for i, x0_pred in enumerate(x0_preds):
@@ -353,7 +485,7 @@ def compute_ppl_trajectory(model, x0_preds, tokenizer, log_every: int = 10):
 
 def plot_results(results: dict, out_dir: str):
     """
-    results: dict mapping quant_type (+ 'default') ->
+    results: dict mapping quant_type (including 'default') ->
         {'l2': [...], 'acc': [...], 'ppl_steps': [...], 'ppl': [...]}
     """
     os.makedirs(out_dir, exist_ok=True)
@@ -370,17 +502,19 @@ def plot_results(results: dict, out_dir: str):
     quant_types = [k for k in results if k != "default"]
 
     fig, axes = plt.subplots(3, 1, figsize=(10, 12), sharex=False)
-    fig.suptitle("Quantization Effect on EBM Inference Trajectory", fontsize=13)
+    fig.suptitle(
+        "Quantization Effect on EBM Inference Trajectory\n(True quantization — bnb module replacement)",
+        fontsize=13,
+    )
     ax_l2, ax_acc, ax_ppl = axes
 
-    # --- L2 and token-agreement plots (share denoising step x-axis) ---
     for qt in quant_types:
-        metrics = results[qt]
-        steps = np.arange(len(metrics["l2"]))
-        ax_l2.plot(steps, metrics["l2"],
-                   label=qt, color=colors[qt], linestyle=linestyles[qt], linewidth=1.8)
-        ax_acc.plot(steps, metrics["acc"],
-                    label=qt, color=colors[qt], linestyle=linestyles[qt], linewidth=1.8)
+        m = results[qt]
+        steps = np.arange(len(m["l2"]))
+        ax_l2.plot(steps, m["l2"], label=qt, color=colors[qt],
+                   linestyle=linestyles[qt], linewidth=1.8)
+        ax_acc.plot(steps, m["acc"], label=qt, color=colors[qt],
+                    linestyle=linestyles[qt], linewidth=1.8)
 
     ax_l2.set_xlabel("Denoising step")
     ax_l2.set_ylabel("Normalised L2 Divergence\n$\\|x_q - x_{ref}\\|_2 / \\|x_{ref}\\|_2$")
@@ -395,14 +529,12 @@ def plot_results(results: dict, out_dir: str):
     ax_acc.set_title("Token-level agreement with default trajectory")
     ax_acc.set_ylim(-0.05, 1.05)
 
-    # --- Generative perplexity over steps (sampled every 10 steps) ---
     for key in ["default"] + quant_types:
         m = results[key]
         if not m.get("ppl"):
             continue
-        ax_ppl.plot(m["ppl_steps"], m["ppl"],
-                    label=key, color=colors[key], linestyle=linestyles[key],
-                    linewidth=1.8, marker="o", markersize=3)
+        ax_ppl.plot(m["ppl_steps"], m["ppl"], label=key, color=colors[key],
+                    linestyle=linestyles[key], linewidth=1.8, marker="o", markersize=3)
 
     ax_ppl.set_xlabel("Denoising step")
     ax_ppl.set_ylabel("Generative Perplexity (GPT-2)\nof argmax(p_x0)")
@@ -411,7 +543,7 @@ def plot_results(results: dict, out_dir: str):
     ax_ppl.set_title("Generative perplexity of model's best-guess clean sequence per step")
 
     plt.tight_layout()
-    out_path = os.path.join(out_dir, "quant_comparison.png")
+    out_path = os.path.join(out_dir, "quant_comparison_real.png")
     plt.savefig(out_path, dpi=150)
     plt.close(fig)
     print(f"Figure saved to {out_path}")
@@ -430,6 +562,7 @@ def _load_model(config, tokenizer):
         config=config,
     )
 
+
 # ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
@@ -438,9 +571,8 @@ def _load_model(config, tokenizer):
 def main(config):
     L.seed_everything(config.seed)
 
-    # PyTorch 2.6+ defaults weights_only=True, but Lightning checkpoints
-    # contain numpy types that aren't allowlisted. Patch torch.load globally
-    # so all checkpoint loads in this process use weights_only=False.
+    # PyTorch 2.6+ defaults weights_only=True, but Lightning checkpoints contain
+    # numpy types that aren't allowlisted.  Patch torch.load globally.
     _orig_torch_load = torch.load
     def _patched_torch_load(f, map_location=None, **kwargs):
         kwargs["weights_only"] = False
@@ -451,7 +583,6 @@ def main(config):
     logger = utils.get_logger(__name__)
     tokenizer = dataloader.get_tokenizer(config)
 
-    # +inference_strategy=standard (default) or cross_step
     inference_strategy = str(getattr(config, "inference_strategy", "standard"))
     if inference_strategy == "cross_step":
         _run_traj = run_trajectory_cross_step
@@ -478,7 +609,7 @@ def main(config):
         )
 
     # ------------------------------------------------------------------ #
-    # Shared starting point x0  (all-mask prior sample)                   #
+    # Shared starting point (all-mask prior sample)                        #
     # ------------------------------------------------------------------ #
     batch_size = config.loader.eval_batch_size
     x0 = model._sample_prior(batch_size, config.model.length).to(model.device)
@@ -487,14 +618,13 @@ def main(config):
     logger.info(f"Using shared RNG seed: {rng_seed}")
 
     # ------------------------------------------------------------------ #
-    # Experiment 1: default (no quantization)                             #
+    # Experiment 1: default (no quantization)                              #
     # ------------------------------------------------------------------ #
     logger.info("Running default (unquantized) trajectory…")
     torch.manual_seed(rng_seed)
     traj_default, x0_preds_default = _run_traj(model, x0, num_steps)
     logger.info(f"  trajectory length: {len(traj_default)} steps")
 
-    # Generative perplexity of the default trajectory (every 10 steps)
     logger.info("  Scoring default trajectory perplexity…")
     ppl_steps_default, ppls_default = compute_ppl_trajectory(
         model, x0_preds_default, tokenizer, log_every=10
@@ -502,15 +632,14 @@ def main(config):
     logger.info(f"  Default final ppl: {ppls_default[-1]:.2f}")
 
     # ------------------------------------------------------------------ #
-    # Experiments 2-5: quantized variants                                 #
+    # Experiments 2-5: quantized variants                                  #
     # ------------------------------------------------------------------ #
     quant_types = ["fp4", "fp8", "int8", "nf4"]
     results = {}
 
     for qt in quant_types:
-        logger.info(f"Running {qt} trajectory…")
-        # Reload from checkpoint instead of deepcopy — deepcopy fails on
-        # non-leaf tensors (e.g. weight_norm / autocast internals).
+        logger.info(f"Running {qt} trajectory (true quantization)…")
+        # Reload fresh from checkpoint — deepcopy fails on non-leaf tensors.
         model_q = _load_model(config, tokenizer)
         model_q.eval()
         if model_q.ema:
@@ -521,14 +650,16 @@ def main(config):
             model_q.ema.copy_to(
                 _it.chain(model_q.backbone.parameters(), model_q.noise.parameters())
             )
-        # Only quantize model.ebm (the trained EBM component).
-        # model.backbone is a frozen HF diffusion model using FlashAttention,
-        # which requires fp16/bf16 and breaks under 4bit/8bit quantization.
-        quantize_model(model_q.ebm, qt)
 
-        torch.manual_seed(rng_seed)  # same RNG state as default run
+        # Replace nn.Linear modules in model.ebm with quantized counterparts.
+        # model.backbone (frozen HF backbone) is left intact — its FlashAttention
+        # layers require a specific dtype flow that bnb modules cannot guarantee.
+        quantize_model_real(model_q.ebm, qt)
+        # Move any newly created buffers/parameters to the right device.
+        model_q.ebm.to(model_q.device)
+
+        torch.manual_seed(rng_seed)
         traj_q, x0_preds_q = _run_traj(model_q, x0, num_steps)
-
         l2_divs, accs = compute_metrics(traj_default, traj_q)
 
         logger.info(f"  Scoring {qt} trajectory perplexity…")
@@ -549,7 +680,6 @@ def main(config):
         del model_q
         torch.cuda.empty_cache()
 
-    # Store default ppl alongside quantized results for plotting
     results["default"] = {
         "l2": [0.0] * len(traj_default),
         "acc": [1.0] * len(traj_default),
@@ -557,9 +687,6 @@ def main(config):
         "ppl": ppls_default,
     }
 
-    # ------------------------------------------------------------------ #
-    # Restore EMA weights if used                                         #
-    # ------------------------------------------------------------------ #
     if model.ema:
         import itertools
         model.ema.restore(
@@ -567,11 +694,9 @@ def main(config):
         )
 
     # ------------------------------------------------------------------ #
-    # Save numerical results and figure                                   #
+    # Save results and figure                                              #
     # ------------------------------------------------------------------ #
-    # hydra.run.dir is the experiment output dir (set via hydra.run.dir= on CLI).
-    # os.getcwd() resolves to that dir after hydra changes working directory.
-    out_dir = os.path.join(os.getcwd(), "quant_analysis")
+    out_dir = os.path.join(os.getcwd(), "quant_analysis_real")
     payload = {
         "results": results,
         "x0": x0.detach().cpu(),
@@ -588,7 +713,6 @@ def main(config):
     logger.info("Saved results.npy with keys: results, x0, metadata")
     plot_results(results, out_dir)
 
-    # Print summary table
     header = f"{'Step':>6} | " + " | ".join(f"{qt:>12}" for qt in quant_types)
     logger.info("=== Normalised L2 divergence per step ===")
     logger.info(header)

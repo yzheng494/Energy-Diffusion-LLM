@@ -1,6 +1,7 @@
 import itertools
 import math
 import os
+import time
 import typing
 from dataclasses import dataclass
 
@@ -132,13 +133,9 @@ class Diffusion(L.LightningModule):
     self.gen_ppl_metric = Perplexity()
     self.entropy_metric = torchmetrics.aggregation.MeanMetric()
     self.time_metric = torchmetrics.aggregation.MeanMetric()
-    self.eval_model_tokenizer = transformers.AutoTokenizer.\
-      from_pretrained(self.gen_ppl_eval_model_name_or_path)
-    if self.eval_model_tokenizer.pad_token is None:
-      self.eval_model_tokenizer.pad_token =\
-          self.eval_model_tokenizer.eos_token
-      self.eval_model_tokenizer.pad_token_id =\
-          self.eval_model_tokenizer.eos_token_id
+    self.eval_model_tokenizer = None
+    self._gen_ppl_eval_model = None
+    self._gen_ppl_warning_issued = False
 
     self.noise = noise_schedule.get_noise(self.config,
                                           dtype=self.dtype)
@@ -170,6 +167,67 @@ class Diffusion(L.LightningModule):
       assert self.parameterization in {'d3pm', 'subs'}
     if self.subs_masking:
       assert self.parameterization == 'd3pm'
+
+  def _warn_gen_ppl_unavailable(self, message):
+    if self._gen_ppl_warning_issued:
+      return
+    self._gen_ppl_warning_issued = True
+    print(f'[gen_ppl] {message}')
+
+  def _load_hf_resource(
+    self,
+    load_fn: typing.Callable[..., typing.Any],
+    resource_name: str):
+    last_error = None
+    for attempt in range(3):
+      try:
+        return load_fn(
+          self.gen_ppl_eval_model_name_or_path,
+          local_files_only=False)
+      except Exception as error:
+        last_error = error
+        if attempt < 2:
+          time.sleep(2 ** attempt)
+    try:
+      return load_fn(
+        self.gen_ppl_eval_model_name_or_path,
+        local_files_only=True)
+    except Exception as error:
+      last_error = error
+    self._warn_gen_ppl_unavailable(
+      'Unable to load '
+      f'{resource_name} "{self.gen_ppl_eval_model_name_or_path}". '
+      'Skipping generative perplexity. '
+      f'Last error: {last_error}')
+    return None
+
+  def _get_eval_model_tokenizer(self):
+    if self.eval_model_tokenizer is not None:
+      return self.eval_model_tokenizer
+    tokenizer = self._load_hf_resource(
+      transformers.AutoTokenizer.from_pretrained,
+      'eval tokenizer')
+    if tokenizer is None:
+      return None
+    if tokenizer.pad_token is None:
+      tokenizer.pad_token = tokenizer.eos_token
+      tokenizer.pad_token_id = tokenizer.eos_token_id
+    self.eval_model_tokenizer = tokenizer
+    return self.eval_model_tokenizer
+
+  def _get_gen_ppl_eval_model(self):
+    if self._gen_ppl_eval_model is not None:
+      return self._gen_ppl_eval_model
+    eval_model = self._load_hf_resource(
+      transformers.AutoModelForCausalLM.from_pretrained,
+      'eval model')
+    if eval_model is None:
+      return None
+    eval_model = eval_model.eval()
+    if 'llama2' not in self.gen_ppl_eval_model_name_or_path:
+      eval_model = eval_model.to(self.device)
+    self._gen_ppl_eval_model = eval_model
+    return self._gen_ppl_eval_model
 
   def on_load_checkpoint(self, checkpoint):
     if self.ema:
@@ -487,6 +545,9 @@ class Diffusion(L.LightningModule):
         attn_mask: Attention mask for the eval model
         eval_context_size: Size of the context for the eval model
     """
+    eval_model_tokenizer = self._get_eval_model_tokenizer()
+    if eval_model_tokenizer is None:
+      return None, None, None
     if 'llama2' in self.gen_ppl_eval_model_name_or_path:
       tokenizer_kwargs = {
         'text_samples': text_samples,
@@ -508,7 +569,7 @@ class Diffusion(L.LightningModule):
         'max_length': max_length,
       }
       eval_context_size = 1024
-    samples = self.eval_model_tokenizer(
+    samples = eval_model_tokenizer(
       text_samples, ** tokenizer_kwargs)
     attn_mask = samples['attention_mask']
     samples = samples['input_ids']
@@ -530,7 +591,7 @@ class Diffusion(L.LightningModule):
     self,
     text_samples: typing.List[str],
     retokenize: bool = True,
-    max_length: typing.Optional[int] = None) -> None:
+    max_length: typing.Optional[int] = None) -> bool:
     """Compute the generative perplexity of the model.
 
     Args:
@@ -541,17 +602,18 @@ class Diffusion(L.LightningModule):
         pre-trained AR model (e.g., GPT2).
     """
     os.environ['TOKENIZERS_PARALLELISM'] = 'false'
-    eval_model = transformers.AutoModelForCausalLM.from_pretrained(
-      self.gen_ppl_eval_model_name_or_path).eval()
+    eval_model = self._get_gen_ppl_eval_model()
+    if eval_model is None:
+      return False
     if max_length is None:
       max_length = self.config.model.length
-    if 'llama2' not in self.gen_ppl_eval_model_name_or_path:
-      eval_model = eval_model.to(self.device)
     # Re-tokenize using eval model's tokenizer
     if retokenize:
       (samples, attn_mask,
        eval_context_size) = self.eval_retokenize(
          text_samples, max_length=max_length)
+      if samples is None:
+        return False
     else:
       samples = text_samples
       attn_mask = torch.ones(samples.shape).to(self.device)
@@ -585,6 +647,7 @@ class Diffusion(L.LightningModule):
           != self.eval_model_tokenizer.eos_token_id)
         self.gen_ppl_metric.update(
           nlls, first_eos[..., 1:] + token_mask[..., 1:])
+    return True
 
   def q_xt(self, x, move_chance):
     """Computes the noisy sample xt.

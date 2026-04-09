@@ -2,11 +2,11 @@
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "${SCRIPT_DIR}/.."
 
-exp=arebm_owt_ckpt_3
+exp=arebm_owt_ckpt_real
 
 export HYDRA_FULL_ERROR=1
 
-python -u -m quant_analysis \
+python -u -m quant_analysis_real \
     loader.batch_size=1 \
     loader.eval_batch_size=1 \
     data=openwebtext-split \

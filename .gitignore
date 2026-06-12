@@ -26,7 +26,6 @@ pip-wheel-metadata/
 # Logs and local runtime outputs
 *.log
 logs/
-outputs/
 wandb/
 
 # Model checkpoints and training artifacts

@@ -1,0 +1,13 @@
+- loader.batch_size=1
+- loader.eval_batch_size=1
+- data=openwebtext-split
+- model=small
+- parameterization=subs
+- ebm_backbone=ar
+- model.length=1024
+- T=0
+- +wandb.offline=true
+- +num_seeds=8
+- +quant_types=[none]
+- +ppl_log_every=10
+- +use_real_quant=true
